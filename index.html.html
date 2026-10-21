@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Detection</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px;
+      background: #101820;
+      color: #eef6f8;
+      font-family: Arial, "Malgun Gothic", sans-serif;
+    }
+    main { max-width: 1000px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .hint { color: #b9cbd2; margin: 0 0 18px; line-height: 1.5; }
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    button {
+      border: 0; border-radius: 8px; padding: 11px 16px;
+      font-size: 15px; font-weight: 700; cursor: pointer;
+      background: #21c77a; color: #062415;
+    }
+    button.secondary { background: #d7e4e8; color: #17252b; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .stage {
+      position: relative; width: 100%; background: #05090b;
+      border: 1px solid #31444c; border-radius: 12px; overflow: hidden;
+      aspect-ratio: 16 / 9;
+    }
+    video, canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    video { display: none; }
+    #overlay { pointer-events: none; }
+    .status {
+      margin-top: 14px; padding: 14px; border-radius: 8px;
+      background: #1a2a33; color: #d7e4e8; line-height: 1.6;
+      white-space: pre-line; overflow-wrap: anywhere;
+    }
+    .small { margin-top: 12px; color: #9fb3bc; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>FACE DETECTION</h1>
+  <p class="hint">웹캠에서 얼굴을 감지하고 얼굴 중심 좌표와 크기를 실시간으로 표시합니다.</p>
+
+  <div class="controls">
+    <button id="startBtn">웹캠 시작</button>
+    <button id="stopBtn" class="secondary" disabled>웹캠 종료</button>
+  </div>
+
+  <div class="stage">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="status" id="status">상태: 시작 버튼을 눌러 웹캠을 켜세요.</div>
+  <p class="small">
+    좌표 기준은 영상의 왼쪽 위 (0, 0)입니다. X는 오른쪽, Y는 아래쪽으로 증가합니다.
+    웹캠 사용 권한이 필요하며, 카메라 접근은 보통 localhost 또는 HTTPS에서 지원됩니다.
+  </p>
+</main>
+
+<script type="module">
+  import {
+    FaceDetector,
+    FilesetResolver
+  } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const statusBox = document.getElementById("status");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+
+  let detector = null;
+  let stream = null;
+  let running = false;
+  let lastDetection = 0;
+
+  function resizeCanvas() {
+    if (!video.videoWidth || !video.videoHeight) return;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+
+  async function setupDetector() {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    return await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      minDetectionConfidence: 0.5
+    });
+  }
+
+  async function startCamera() {
+    startBtn.disabled = true;
+    statusBox.textContent = "상태: 얼굴 인식 모델을 불러오는 중입니다...";
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("이 브라우저에서는 웹캠을 사용할 수 없습니다. localhost 또는 HTTPS에서 열어 주세요.");
+      }
+
+      detector = detector || await setupDetector();
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user" },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      await new Promise(resolve => {
+        if (video.videoWidth) resolve();
+        else video.addEventListener("loadedmetadata", resolve, { once: true });
+      });
+
+      resizeCanvas();
+      running = true;
+      stopBtn.disabled = false;
+      statusBox.textContent = "상태: 웹캠 실행 중\n얼굴을 카메라에 비춰 보세요.";
+      requestAnimationFrame(detectLoop);
+    } catch (error) {
+      stopCamera();
+      statusBox.textContent = "실행 오류: " + error.message +
+        "\n인터넷 연결, 웹캠 권한, 브라우저의 카메라 접근 설정을 확인하세요.";
+      startBtn.disabled = false;
+    }
+  }
+
+  function detectLoop(timestamp) {
+    if (!running) return;
+    if (video.readyState >= 2 && timestamp - lastDetection > 70) {
+      lastDetection = timestamp;
+      resizeCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      try {
+        const result = detector.detectForVideo(video, timestamp);
+        const detections = result.detections || [];
+        const lines = ["상태: 얼굴 인식 중", `감지된 얼굴 수: ${detections.length}`];
+
+        detections.forEach((detection, i) => {
+          const box = detection.boundingBox;
+          if (!box) return;
+
+          const x = box.originX;
+          const y = box.originY;
+          const w = box.width;
+          const h = box.height;
+          const centerX = Math.round(x + w / 2);
+          const centerY = Math.round(y + h / 2);
+
+          ctx.strokeStyle = "#00ff66";
+          ctx.lineWidth = Math.max(2, canvas.width / 500);
+          ctx.strokeRect(x, y, w, h);
+
+          ctx.fillStyle = "#00ff66";
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, Math.max(4, canvas.width / 200), 0, Math.PI * 2);
+          ctx.fill();
+
+          lines.push(
+            `Face ${i + 1}: X=${centerX}, Y=${centerY}`,
+            `W=${Math.round(w)}, H=${Math.round(h)}`
+          );
+        });
+
+        if (detections.length === 0) lines.push("No Face Detected");
+        statusBox.textContent = lines.join("\n");
+
+        // 영상 안의 왼쪽 상단에도 상태와 첫 얼굴 좌표 표시
+        ctx.save();
+        ctx.setTransform(-1, 0, 0, 1, canvas.width, 0);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+        ctx.fillRect(canvas.width - 300, 0, 294, 78);
+        ctx.fillStyle = "#00ff66";
+        ctx.font = `bold ${Math.max(16, canvas.width / 55)}px Arial`;
+        ctx.fillText("FACE DETECTION", canvas.width - 288, 26);
+        ctx.fillStyle = "#fff36b";
+        const first = detections[0]?.boundingBox;
+        if (first) {
+          const cx = Math.round(first.originX + first.width / 2);
+          const cy = Math.round(first.originY + first.height / 2);
+          ctx.fillText(`X=${cx}, Y=${cy}`, canvas.width - 288, 53);
+        } else {
+          ctx.fillText("No Face Detected", canvas.width - 288, 53);
+        }
+        ctx.restore();
+      } catch (error) {
+        statusBox.textContent = "얼굴 인식 중 오류가 발생했습니다: " + error.message;
+      }
+    }
+    requestAnimationFrame(detectLoop);
+  }
+
+  function stopCamera() {
+    running = false;
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+    statusBox.textContent = "상태: 웹캠이 종료되었습니다.";
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  stopBtn.addEventListener("click", stopCamera);
+  window.addEventListener("beforeunload", stopCamera);
+</script>
+</body>
+</html>
